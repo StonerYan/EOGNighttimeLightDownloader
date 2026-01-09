@@ -39,7 +39,7 @@ This tool solves common challenges when downloading large datasets from EOG, suc
 ## Usage
 
 1. Open `EOGNighttimeLightDownload.py`.
-2. Configure your EOG credentials (optional but recommended for automation). You can set them via Environment Variables or modify the script (avoid committing credentials to Git!):
+2. Configure your EOG credentials (optional but recommended for automation). You can set them via Environment Variables or modify the script:
 
    ```python
    # In EOGNighttimeLightDownload.py
