@@ -22,53 +22,71 @@ DEFAULT_CLIENT_ID = "eogdata-new-apache"
 REDIRECT_URI = "https://eogdata.mines.edu/oauth2callback"
 MAX_WORKERS = 4  # Number of concurrent downloads
 
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
 class EOGAuthenticator:
     def __init__(self, username, password, client_id=None, client_secret=None):
         self.username = username
         self.password = password
         self.client_id = client_id or DEFAULT_CLIENT_ID
         self.client_secret = client_secret
-        self.session = requests.Session()
         self.lock = threading.Lock()
+        self.session = self._create_session()
+
+    def _create_session(self):
+        """
+        Create a new session with robust retry logic for connection stability.
+        """
+        session = requests.Session()
+        
+        # Configure robust retries for connection errors and server errors
+        retries = Retry(
+            total=10,
+            backoff_factor=1,  # Wait 1s, 2s, 4s...
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
     def get(self, url, **kwargs):
         """
-        Wrapper for session.get with automatic retry on 401/403/503 errors.
+        Wrapper for session.get with automatic retry on 401/403/503 and Connection Errors.
         """
         retry_count = 0
-        max_retries = 5
+        max_retries = 10  # Increased max retries
         base_delay = 5
 
         while retry_count < max_retries:
             try:
                 # If streaming, we return the response object directly
-                # The caller is responsible for closing it or using a context manager
                 response = self.session.get(url, **kwargs)
                 
                 # Check if we were redirected to login page (which returns 200 OK)
                 if response.url.startswith(AUTH_BASE):
                      tqdm.write("Detected redirect to login page. Session expired.")
-                     # Raise HTTPError to trigger retry logic
                      fake_error = requests.exceptions.HTTPError("Session Expired")
                      fake_error.response = response
-                     # Set status to 401 for our handler
                      response.status_code = 401 
                      raise fake_error
                 
                 response.raise_for_status()
                 return response
+
             except requests.exceptions.HTTPError as e:
                 status_code = e.response.status_code
                 if status_code in [401, 403, 503]:
                     tqdm.write(f"Encountered {status_code} error. Attempting re-login/retry ({retry_count + 1}/{max_retries})...")
                     
-                    # Random jitter to prevent thundering herd if many threads hit this
-                    time.sleep(base_delay * (retry_count + 1))
+                    # Random jitter to prevent thundering herd
+                    time.sleep(base_delay * (retry_count + 1) + (time.time() % 1))
                     
                     with self.lock:
                         # Re-authenticate
-                        # We only need one thread to do this, others can wait
-                        # But simpler to just call it; login_and_get_session handles the flow
                         if self.login_and_get_session():
                             tqdm.write("Re-login successful. Retrying request...")
                         else:
@@ -78,18 +96,39 @@ class EOGAuthenticator:
                     continue
                 else:
                     raise e
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                tqdm.write(f"Connection/Timeout error: {e}. Retrying ({retry_count + 1}/{max_retries})...")
-                time.sleep(base_delay * (retry_count + 1))
+
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, 
+                    requests.exceptions.ChunkedEncodingError) as e:
+                # Catch-all for connection issues (RemoteDisconnected, ProtocolError, etc.)
+                tqdm.write(f"Connection unstable: {e}. Rebuilding session and retrying ({retry_count + 1}/{max_retries})...")
+                
+                # Jitter wait
+                time.sleep(base_delay * (retry_count + 1) + (time.time() % 1))
+                
+                with self.lock:
+                    # Force session rebuild on connection failure
+                    tqdm.write("Rebuilding session...")
+                    # We try to re-login to get a fresh session and token
+                    if self.login_and_get_session():
+                         tqdm.write("Session rebuilt and re-authenticated.")
+                    else:
+                         tqdm.write("Session rebuild failed, will try current session anyway.")
+                
                 retry_count += 1
                 continue
+            
+            except Exception as e:
+                tqdm.write(f"Unexpected error: {e}. Retrying...")
+                retry_count += 1
+                time.sleep(base_delay)
+                continue
                 
-        # If we exhausted retries, try one last time (will raise exception if fails)
+        # If we exhausted retries, try one last time
         return self.session.get(url, **kwargs)
 
     def login_and_get_session(self):
-        # Reset session to ensure clean state for re-login (clears old cookies/headers)
-        self.session = requests.Session()
+        # Reset session to ensure clean state (clears old cookies/headers/connection pool)
+        self.session = self._create_session()
         
         # Try direct password grant first (fastest)
         tqdm.write(f"Attempting direct login with client_id='{self.client_id}'...")
