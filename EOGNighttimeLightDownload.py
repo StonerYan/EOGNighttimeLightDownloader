@@ -1,0 +1,430 @@
+import os
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, unquote, urlparse, parse_qs
+import sys
+from tqdm import tqdm
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+
+# User Credentials - FILL THESE IN
+USERNAME = ""
+PASSWORD = ""
+
+# Configuration
+BASE_URL = "https://eogdata.mines.edu/nighttime_light/monthly_notile/"
+AUTH_BASE = "https://eogauth-new.mines.edu/realms/eog/protocol/openid-connect"
+TOKEN_URL = f"{AUTH_BASE}/token"
+AUTH_URL = f"{AUTH_BASE}/auth"
+DEFAULT_CLIENT_ID = "eogdata-new-apache"
+REDIRECT_URI = "https://eogdata.mines.edu/oauth2callback"
+MAX_WORKERS = 4  # Number of concurrent downloads
+
+class EOGAuthenticator:
+    def __init__(self, username, password, client_id=None, client_secret=None):
+        self.username = username
+        self.password = password
+        self.client_id = client_id or DEFAULT_CLIENT_ID
+        self.client_secret = client_secret
+        self.session = requests.Session()
+        self.lock = threading.Lock()
+
+    def get(self, url, **kwargs):
+        """
+        Wrapper for session.get with automatic retry on 401/403/503 errors.
+        """
+        retry_count = 0
+        max_retries = 5
+        base_delay = 5
+
+        while retry_count < max_retries:
+            try:
+                # If streaming, we return the response object directly
+                # The caller is responsible for closing it or using a context manager
+                response = self.session.get(url, **kwargs)
+                
+                # Check if we were redirected to login page (which returns 200 OK)
+                if response.url.startswith(AUTH_BASE):
+                     tqdm.write("Detected redirect to login page. Session expired.")
+                     # Raise HTTPError to trigger retry logic
+                     fake_error = requests.exceptions.HTTPError("Session Expired")
+                     fake_error.response = response
+                     # Set status to 401 for our handler
+                     response.status_code = 401 
+                     raise fake_error
+                
+                response.raise_for_status()
+                return response
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code
+                if status_code in [401, 403, 503]:
+                    tqdm.write(f"Encountered {status_code} error. Attempting re-login/retry ({retry_count + 1}/{max_retries})...")
+                    
+                    # Random jitter to prevent thundering herd if many threads hit this
+                    time.sleep(base_delay * (retry_count + 1))
+                    
+                    with self.lock:
+                        # Re-authenticate
+                        # We only need one thread to do this, others can wait
+                        # But simpler to just call it; login_and_get_session handles the flow
+                        if self.login_and_get_session():
+                            tqdm.write("Re-login successful. Retrying request...")
+                        else:
+                            tqdm.write("Re-login failed.")
+                    
+                    retry_count += 1
+                    continue
+                else:
+                    raise e
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                tqdm.write(f"Connection/Timeout error: {e}. Retrying ({retry_count + 1}/{max_retries})...")
+                time.sleep(base_delay * (retry_count + 1))
+                retry_count += 1
+                continue
+                
+        # If we exhausted retries, try one last time (will raise exception if fails)
+        return self.session.get(url, **kwargs)
+
+    def login_and_get_session(self):
+        # Reset session to ensure clean state for re-login (clears old cookies/headers)
+        self.session = requests.Session()
+        
+        # Try direct password grant first (fastest)
+        tqdm.write(f"Attempting direct login with client_id='{self.client_id}'...")
+        if self._login_password_grant():
+            tqdm.write("Direct login successful.")
+            return True
+        
+        # If failed and no secret provided (public client), try browser flow
+        if not self.client_secret:
+            tqdm.write("Direct login failed. Attempting browser simulation flow...")
+            return self._login_browser_flow()
+        
+        return False
+
+    def _login_password_grant(self):
+        payload = {
+            'client_id': self.client_id,
+            'username': self.username,
+            'password': self.password,
+            'grant_type': 'password'
+        }
+        if self.client_secret:
+            payload['client_secret'] = self.client_secret
+            
+        try:
+            response = self.session.post(TOKEN_URL, data=payload)
+            if response.status_code == 200:
+                token = response.json().get('access_token')
+                self.session.headers.update({'Authorization': f'Bearer {token}'})
+                return True
+            else:
+                tqdm.write(f"Direct login failed: {response.text}")
+        except Exception as e:
+            tqdm.write(f"Direct login error: {e}")
+        return False
+
+    def _login_browser_flow(self):
+        try:
+            # Step 1: Get the login page
+            params = {
+                'response_type': 'code',
+                'client_id': self.client_id,
+                'redirect_uri': REDIRECT_URI,
+                'scope': 'openid email',
+                'state': '12345' # Dummy state
+            }
+            r = self.session.get(AUTH_URL, params=params)
+            r.raise_for_status()
+            
+            # Step 2: Parse form action
+            soup = BeautifulSoup(r.text, 'html.parser')
+            form = soup.find('form', id='kc-form-login')
+            if not form:
+                # Maybe already logged in? Check if we can access protected resource
+                tqdm.write("Could not find login form. Checking if already authenticated...")
+                return self._check_auth()
+            
+            action_url = form.get('action')
+            if not action_url:
+                action_url = r.url # Post to same URL if no action
+
+            # Step 3: Post credentials
+            login_data = {
+                'username': self.username,
+                'password': self.password,
+                'credentialId': ''
+            }
+            
+            # Add hidden fields
+            for inp in form.find_all('input'):
+                if inp.get('type') == 'hidden':
+                    login_data[inp.get('name')] = inp.get('value')
+            
+            # Follow redirects automatically now to complete the flow (Keycloak -> App -> Original URL)
+            r_post = self.session.post(action_url, data=login_data, allow_redirects=True)
+            
+            # Check for Keycloak errors in the final page content if we didn't redirect away
+            if "kc-feedback-text" in r_post.text or "pf-c-alert__title" in r_post.text:
+                soup_post = BeautifulSoup(r_post.text, 'html.parser')
+                err = soup_post.find('span', class_='pf-c-alert__title')
+                if err:
+                    tqdm.write(f"Login Error: {err.get_text().strip()}")
+                return False
+
+            # Verify authentication by accessing the protected base URL
+            return self._check_auth()
+
+        except Exception as e:
+            tqdm.write(f"Browser flow error: {e}")
+            return False
+
+    def _check_auth(self):
+        try:
+            r = self.session.get(BASE_URL)
+            if r.status_code == 200:
+                tqdm.write("Authentication verified.")
+                return True
+            tqdm.write(f"Authentication verification failed. Status code: {r.status_code}")
+            return False
+        except Exception as e:
+            tqdm.write(f"Auth check error: {e}")
+            return False
+
+def get_files_and_dirs(url, authenticator):
+    """
+    Parse a directory listing URL to find files and subdirectories.
+    """
+    try:
+        # Use authenticator.get() instead of session.get() to handle retries
+        response = authenticator.get(url)
+        # No need for raise_for_status here as authenticator.get already checks it inside retry loop 
+        # (mostly, but returns final attempt result if retries exhausted, so checking again is fine)
+        if response.status_code != 200:
+             response.raise_for_status()
+    except Exception as e:
+        tqdm.write(f"Failed to access {url}: {e}")
+        return [], []
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    files = []
+    dirs = []
+    
+    for link in soup.find_all('a'):
+        href = link.get('href')
+        # Skip parent directory links and query parameters
+        if not href or href in ['../', './'] or href.startswith('?') or href.startswith('/'):
+            continue
+            
+        full_url = urljoin(url, href)
+        if href.endswith('/'):
+            dirs.append(full_url)
+        else:
+            files.append(full_url)
+            
+    return files, dirs
+
+def download_file(url, save_path, authenticator):
+    """
+    Download a single file with resume capability and progress bar.
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Check if file exists to resume
+    resume_header = {}
+    file_mode = 'wb'
+    existing_size = 0
+    
+    if os.path.exists(save_path):
+        existing_size = os.path.getsize(save_path)
+        resume_header = {'Range': f'bytes={existing_size}-'}
+        file_mode = 'ab'
+
+    try:
+        # Initial request to check total size and support for range
+        # Use authenticator.get() for robustness
+        # Note: authenticator.get returns a response object.
+        # We MUST ensure it's closed properly.
+        
+        r = authenticator.get(url, stream=True, headers=resume_header)
+        
+        # We'll use a loop to handle the potential re-download case cleaner
+        # and ensure resources are closed.
+        
+        try:
+            # If server returns 416 Range Not Satisfiable, maybe the file is already complete
+            if r.status_code == 416:
+                # Check total size from a fresh HEAD request (or GET)
+                head_resp = authenticator.get(url, stream=False) 
+                total_size = int(head_resp.headers.get('content-length', 0))
+                head_resp.close()
+                
+                if existing_size >= total_size:
+                    tqdm.write(f"Skipping already completed file: {os.path.basename(save_path)}")
+                    return
+                else:
+                    # File on disk is larger than server? Re-download
+                    tqdm.write(f"File corruption detected. Re-downloading: {save_path}")
+                    os.remove(save_path)
+                    existing_size = 0
+                    resume_header = {}
+                    file_mode = 'wb'
+                    
+                    # Close the 416 response before getting a new one
+                    r.close()
+                    # Re-request
+                    r = authenticator.get(url, stream=True)
+
+            r.raise_for_status()
+            
+            total_size = int(r.headers.get('content-length', 0))
+            
+            # If status is 206, it means partial content (resume supported)
+            # If 200, it means server ignored range or sent full file
+            if r.status_code == 206:
+                total_size += existing_size
+            elif r.status_code == 200 and existing_size > 0:
+                # Server doesn't support range, re-downloading from scratch
+                tqdm.write(f"Server doesn't support resume for {os.path.basename(save_path)}. Re-downloading.")
+                existing_size = 0
+                file_mode = 'wb'
+
+            desc = os.path.basename(save_path)
+            if len(desc) > 30:
+                desc = desc[:27] + "..."
+            
+            # If file is already complete
+            if existing_size >= total_size and total_size > 0:
+                 tqdm.write(f"Skipping already completed file: {os.path.basename(save_path)}")
+                 return
+
+            with open(save_path, file_mode) as f, tqdm(
+                desc=desc,
+                total=total_size,
+                initial=existing_size,
+                unit='iB',
+                unit_scale=True,
+                unit_divisor=1024,
+                leave=False # Don't leave progress bars to avoid clutter with threads
+            ) as bar:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        size = f.write(chunk)
+                        bar.update(size)
+        finally:
+            # Ensure the response is closed, whether it was the first or second one
+            r.close()
+                        
+    except Exception as e:
+        tqdm.write(f"Error downloading {url}: {e}")
+
+
+def collect_files(url, base_save_dir, authenticator, all_files_list):
+    """
+    Recursively scan directories and collect all files to download.
+    Filters applied:
+    1. Skip 'vcmslcfg' directories (prefer 'vcmcfg').
+    2. Only download .tif.gz files (skip .tif).
+    3. Only download *.avg_rade9h.tif.gz and *.cf_cvg.tif.gz.
+    """
+    if not url.startswith(BASE_URL):
+        return
+
+    rel_path = unquote(url[len(BASE_URL):])
+    rel_path = rel_path.lstrip('/')
+    current_save_dir = os.path.join(base_save_dir, rel_path)
+    
+    tqdm.write(f"Scanning directory: {url}")
+    files, dirs = get_files_and_dirs(url, authenticator)
+    
+    for file_url in files:
+        filename = unquote(file_url.split('/')[-1])
+        
+        # Filter: Only .tif.gz
+        if not filename.endswith('.tif.gz'):
+            continue
+            
+        # Filter: Specific file types
+        # Keep: *.avg_rade9h.tif.gz and *.cf_cvg.tif.gz
+        # Exclude: *.cvg.tif.gz, *.avg_rade9h.masked.tif.gz, etc.
+        if not (filename.endswith('.avg_rade9h.tif.gz') or filename.endswith('.cf_cvg.tif.gz')):
+            continue
+
+        save_path = os.path.join(current_save_dir, filename)
+        all_files_list.append((file_url, save_path))
+        
+    for dir_url in dirs:
+        # Check directory name to filter out unwanted folders like 'vcmslcfg'
+        # dir_url ends with '/', so we strip it to get the name
+        dir_name = unquote(dir_url.rstrip('/').split('/')[-1])
+        
+        if dir_name == 'vcmslcfg':
+            tqdm.write(f"Skipping excluded directory: {dir_name}")
+            continue
+            
+        collect_files(dir_url, base_save_dir, authenticator, all_files_list)
+
+def main():
+    print("=== EOG Data Downloader (Multi-threaded & Resume & Auto-Relogin) ===")
+    print(f"Target URL: {BASE_URL}")
+    print("-" * 50)
+    
+    # Use hardcoded credentials if available, otherwise fallback to env vars or input (optional)
+    username = USERNAME or os.environ.get('EOG_USERNAME')
+    password = PASSWORD or os.environ.get('EOG_PASSWORD')
+    
+    if not username or not password:
+        print("Error: Please fill in USERNAME and PASSWORD at the top of the script.")
+        # If user runs this without editing, give them a chance to input
+        username = input("Or enter Username (email) now: ")
+        password = input("Enter Password now: ")
+        if not username or not password:
+            return
+
+    # Default public client
+    client_id = DEFAULT_CLIENT_ID
+    client_secret = None 
+    
+    authenticator = EOGAuthenticator(username, password, client_id, client_secret)
+    
+    print("Initial authentication...")
+    if not authenticator.login_and_get_session():
+        print("Authentication failed. Exiting.")
+        return
+
+    save_dir = "./eog_downloads" # Default directory
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    save_dir = os.path.abspath(save_dir)
+    print(f"Files will be saved to: {save_dir}")
+    
+    print("\nPhase 1: Scanning directory structure (this may take a moment)...")
+    all_files_to_download = []
+    collect_files(BASE_URL, save_dir, authenticator, all_files_to_download)
+    
+    print(f"\nPhase 2: Starting download of {len(all_files_to_download)} files with {MAX_WORKERS} threads...")
+    print("Resume capability is enabled. Press Ctrl+C to stop safely.")
+    
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # We pass the authenticator object, which handles thread-safe re-login internally
+            futures = [
+                executor.submit(download_file, url, path, authenticator)
+                for url, path in all_files_to_download
+            ]
+            
+            # Wait for all downloads to complete
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Total Progress"):
+                future.result()
+                
+    except KeyboardInterrupt:
+        print("\nDownload stopped by user.")
+        sys.exit(0)
+        
+    print("\nAll downloads completed.")
+
+if __name__ == "__main__":
+    main()
