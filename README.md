@@ -7,14 +7,19 @@ This tool solves common challenges when downloading large datasets from EOG, suc
 ## Key Features
 
 - **🔐 Automatic Authentication**: Handles EOG's OAuth2 login flow automatically (Password Grant or Browser Flow simulation).
-- **🔄 Session Keep-Alive**: Intelligently detects session expirations (401/403/503 errors) and re-authenticates in the background without crashing the script.
+- **🔄 Session Keep-Alive & Auto-Retry**: 
+  - Intelligently detects session expirations (401/403/503) and re-authenticates.
+  - Automatically rebuilds broken connections (RemoteDisconnected).
+  - Uses exponential backoff and jitter to prevent server overload.
+- **💾 Smart Caching**: Saves the scanned file list to `eog_files_cache.json`. On subsequent runs, you can skip the time-consuming directory scanning process.
+- **🔁 Loop-Until-Success**: Implements a "clean-up" loop. If some downloads fail in the first round, the script automatically retries only the failed files in subsequent rounds until all files are successfully downloaded.
 - **⏯️ Resumable Downloads**: Supports HTTP Range headers to resume interrupted downloads from where they left off.
 - **🚀 Multi-threading**: Downloads multiple files in parallel to maximize bandwidth usage.
 - **🔍 Smart Filtering**:
   - Recursively crawls the monthly directory structure.
   - **Directory Filter**: Skips `vcmslcfg` folders, focusing on `vcmcfg`.
   - **File Filter**: Downloads only `.tif.gz` compressed files.
-  - **Product Filter**: Specifically targets `avg_rade9h` (average radiance) and `cf_cvg` (cloud-free coverages) files, excluding masked or other intermediate versions.
+  - **Product Filter**: Specifically targets `avg_rade9h` (average radiance) and `cf_cvg` (cloud-free coverages) files.
 
 ## Requirements
 
@@ -54,11 +59,11 @@ This tool solves common challenges when downloading large datasets from EOG, suc
    python EOGNighttimeLightDownload.py
    ```
 
-4. The script will:
-   - Authenticate with EOG.
-   - Scan the directory structure starting from `2012` (or configured base URL).
-   - Filter out unwanted files.
-   - Start downloading files to `./eog_downloads`.
+4. **Workflow**:
+   - **Authentication**: Logs in to EOG.
+   - **Scanning**: Scans directories (or loads from `eog_files_cache.json` if available).
+   - **Downloading**: Starts multi-threaded download.
+   - **Retrying**: If any files fail, it enters a retry loop until 100% completion.
 
 ## Configuration
 
