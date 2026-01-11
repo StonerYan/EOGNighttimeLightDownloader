@@ -69,4 +69,4 @@ You can modify the `Configuration` section in the script to change targets:
 
 ## Disclaimer
 
-This tool is for research and educational purposes. Please ensure you comply with EOG's [Data Use Policy](https://eogdata.mines.edu/products/dmsp/#download). Data copyright belongs to the Earth Observation Group, Payne Institute for Public Policy, Colorado School of Mines.
+This tool is for research and educational purposes. Please ensure you comply with EOG's Data Use Policy. Data copyright belongs to the Earth Observation Group, Payne Institute for Public Policy, Colorado School of Mines.
