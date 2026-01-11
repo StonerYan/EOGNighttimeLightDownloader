@@ -8,6 +8,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
+import json
 
 # User Credentials - FILL THESE IN
 USERNAME = ""
@@ -21,11 +22,13 @@ AUTH_URL = f"{AUTH_BASE}/auth"
 DEFAULT_CLIENT_ID = "eogdata-new-apache"
 REDIRECT_URI = "https://eogdata.mines.edu/oauth2callback"
 MAX_WORKERS = 4  # Number of concurrent downloads
+CACHE_FILE = "eog_files_cache.json"
 
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
 class EOGAuthenticator:
+    # ... (init and _create_session remain the same)
     def __init__(self, username, password, client_id=None, client_secret=None):
         self.username = username
         self.password = password
@@ -56,10 +59,15 @@ class EOGAuthenticator:
     def get(self, url, **kwargs):
         """
         Wrapper for session.get with automatic retry on 401/403/503 and Connection Errors.
+        Enforces a default timeout if not provided.
         """
         retry_count = 0
         max_retries = 10  # Increased max retries
         base_delay = 5
+        
+        # Set default timeout (connect, read) if not provided to prevent hanging
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = (15, 60) # 15s connect, 60s read
 
         while retry_count < max_retries:
             try:
@@ -78,20 +86,16 @@ class EOGAuthenticator:
                 return response
 
             except requests.exceptions.HTTPError as e:
+                # ... (error handling remains similar, ensuring loops don't hang)
                 status_code = e.response.status_code
                 if status_code in [401, 403, 503]:
                     tqdm.write(f"Encountered {status_code} error. Attempting re-login/retry ({retry_count + 1}/{max_retries})...")
-                    
-                    # Random jitter to prevent thundering herd
                     time.sleep(base_delay * (retry_count + 1) + (time.time() % 1))
-                    
                     with self.lock:
-                        # Re-authenticate
                         if self.login_and_get_session():
                             tqdm.write("Re-login successful. Retrying request...")
                         else:
                             tqdm.write("Re-login failed.")
-                    
                     retry_count += 1
                     continue
                 else:
@@ -99,21 +103,14 @@ class EOGAuthenticator:
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, 
                     requests.exceptions.ChunkedEncodingError) as e:
-                # Catch-all for connection issues (RemoteDisconnected, ProtocolError, etc.)
                 tqdm.write(f"Connection unstable: {e}. Rebuilding session and retrying ({retry_count + 1}/{max_retries})...")
-                
-                # Jitter wait
                 time.sleep(base_delay * (retry_count + 1) + (time.time() % 1))
-                
                 with self.lock:
-                    # Force session rebuild on connection failure
                     tqdm.write("Rebuilding session...")
-                    # We try to re-login to get a fresh session and token
                     if self.login_and_get_session():
                          tqdm.write("Session rebuilt and re-authenticated.")
                     else:
                          tqdm.write("Session rebuild failed, will try current session anyway.")
-                
                 retry_count += 1
                 continue
             
@@ -126,6 +123,7 @@ class EOGAuthenticator:
         # If we exhausted retries, try one last time
         return self.session.get(url, **kwargs)
 
+    # ... (login methods remain the same)
     def login_and_get_session(self):
         # Reset session to ensure clean state (clears old cookies/headers/connection pool)
         self.session = self._create_session()
@@ -239,8 +237,6 @@ def get_files_and_dirs(url, authenticator):
     try:
         # Use authenticator.get() instead of session.get() to handle retries
         response = authenticator.get(url)
-        # No need for raise_for_status here as authenticator.get already checks it inside retry loop 
-        # (mostly, but returns final attempt result if retries exhausted, so checking again is fine)
         if response.status_code != 200:
              response.raise_for_status()
     except Exception as e:
@@ -268,6 +264,7 @@ def get_files_and_dirs(url, authenticator):
 def download_file(url, save_path, authenticator):
     """
     Download a single file with resume capability and progress bar.
+    Returns True if successful (or skipped), False if failed.
     """
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -285,25 +282,19 @@ def download_file(url, save_path, authenticator):
     try:
         # Initial request to check total size and support for range
         # Use authenticator.get() for robustness
-        # Note: authenticator.get returns a response object.
-        # We MUST ensure it's closed properly.
-        
-        r = authenticator.get(url, stream=True, headers=resume_header)
-        
-        # We'll use a loop to handle the potential re-download case cleaner
-        # and ensure resources are closed.
+        r = authenticator.get(url, stream=True, headers=resume_header, timeout=(15, 60))
         
         try:
             # If server returns 416 Range Not Satisfiable, maybe the file is already complete
             if r.status_code == 416:
                 # Check total size from a fresh HEAD request (or GET)
-                head_resp = authenticator.get(url, stream=False) 
+                head_resp = authenticator.get(url, stream=False, timeout=(15, 60)) 
                 total_size = int(head_resp.headers.get('content-length', 0))
                 head_resp.close()
                 
                 if existing_size >= total_size:
                     tqdm.write(f"Skipping already completed file: {os.path.basename(save_path)}")
-                    return
+                    return True
                 else:
                     # File on disk is larger than server? Re-download
                     tqdm.write(f"File corruption detected. Re-downloading: {save_path}")
@@ -315,14 +306,13 @@ def download_file(url, save_path, authenticator):
                     # Close the 416 response before getting a new one
                     r.close()
                     # Re-request
-                    r = authenticator.get(url, stream=True)
+                    r = authenticator.get(url, stream=True, timeout=(15, 60))
 
             r.raise_for_status()
             
             total_size = int(r.headers.get('content-length', 0))
             
             # If status is 206, it means partial content (resume supported)
-            # If 200, it means server ignored range or sent full file
             if r.status_code == 206:
                 total_size += existing_size
             elif r.status_code == 200 and existing_size > 0:
@@ -338,7 +328,7 @@ def download_file(url, save_path, authenticator):
             # If file is already complete
             if existing_size >= total_size and total_size > 0:
                  tqdm.write(f"Skipping already completed file: {os.path.basename(save_path)}")
-                 return
+                 return True
 
             with open(save_path, file_mode) as f, tqdm(
                 desc=desc,
@@ -353,13 +343,13 @@ def download_file(url, save_path, authenticator):
                     if chunk:
                         size = f.write(chunk)
                         bar.update(size)
+            return True
         finally:
-            # Ensure the response is closed, whether it was the first or second one
             r.close()
                         
     except Exception as e:
         tqdm.write(f"Error downloading {url}: {e}")
-
+        return False
 
 def collect_files(url, base_save_dir, authenticator, all_files_list):
     """
@@ -407,7 +397,7 @@ def collect_files(url, base_save_dir, authenticator, all_files_list):
         collect_files(dir_url, base_save_dir, authenticator, all_files_list)
 
 def main():
-    print("=== EOG Data Downloader (Multi-threaded & Resume & Auto-Relogin) ===")
+    print("=== EOG Data Downloader (Multi-threaded & Resume & Auto-Relogin & Cache) ===")
     print(f"Target URL: {BASE_URL}")
     print("-" * 50)
     
@@ -417,7 +407,6 @@ def main():
     
     if not username or not password:
         print("Error: Please fill in USERNAME and PASSWORD at the top of the script.")
-        # If user runs this without editing, give them a chance to input
         username = input("Or enter Username (email) now: ")
         password = input("Enter Password now: ")
         if not username or not password:
@@ -440,24 +429,73 @@ def main():
     save_dir = os.path.abspath(save_dir)
     print(f"Files will be saved to: {save_dir}")
     
-    print("\nPhase 1: Scanning directory structure (this may take a moment)...")
+    # Phase 1: Scan or Load Cache
     all_files_to_download = []
-    collect_files(BASE_URL, save_dir, authenticator, all_files_to_download)
     
+    if os.path.exists(CACHE_FILE):
+        print(f"\nFound cache file '{CACHE_FILE}'.")
+        choice = input("Use cached file list? (y/n) [y]: ").strip().lower()
+        if choice in ('', 'y', 'yes'):
+            try:
+                with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    # Cache format: list of [url, save_path]
+                    all_files_to_download = cached_data
+                print(f"Loaded {len(all_files_to_download)} files from cache.")
+            except Exception as e:
+                print(f"Error loading cache: {e}. Will rescan.")
+    
+    if not all_files_to_download:
+        print("\nPhase 1: Scanning directory structure (this may take a while)...")
+        collect_files(BASE_URL, save_dir, authenticator, all_files_to_download)
+        
+        # Save to cache
+        try:
+            with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(all_files_to_download, f, indent=2)
+            print(f"Scan complete. Saved {len(all_files_to_download)} files to '{CACHE_FILE}'.")
+        except Exception as e:
+            print(f"Warning: Could not save cache: {e}")
+
+    # Phase 2: Download Loop
     print(f"\nPhase 2: Starting download of {len(all_files_to_download)} files with {MAX_WORKERS} threads...")
     print("Resume capability is enabled. Press Ctrl+C to stop safely.")
     
+    pending_files = all_files_to_download
+    round_num = 1
+    
     try:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # We pass the authenticator object, which handles thread-safe re-login internally
-            futures = [
-                executor.submit(download_file, url, path, authenticator)
-                for url, path in all_files_to_download
-            ]
+        while pending_files:
+            print(f"\n--- Round {round_num}: Downloading {len(pending_files)} files ---")
+            failed_files = []
             
-            # Wait for all downloads to complete
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Total Progress"):
-                future.result()
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Map future to (url, path) so we know which one failed
+                future_to_file = {
+                    executor.submit(download_file, url, path, authenticator): (url, path)
+                    for url, path in pending_files
+                }
+                
+                for future in tqdm(as_completed(future_to_file), total=len(pending_files), desc=f"Round {round_num}"):
+                    url, path = future_to_file[future]
+                    try:
+                        success = future.result()
+                        if not success:
+                            failed_files.append((url, path))
+                    except Exception as e:
+                        tqdm.write(f"Exception for {url}: {e}")
+                        failed_files.append((url, path))
+            
+            if not failed_files:
+                print("\nAll files downloaded successfully!")
+                break
+            
+            print(f"\nRound {round_num} completed. {len(failed_files)} files failed or incomplete.")
+            print("Retrying failed files in 5 seconds...")
+            time.sleep(5)
+            
+            pending_files = failed_files
+            round_num += 1
                 
     except KeyboardInterrupt:
         print("\nDownload stopped by user.")
