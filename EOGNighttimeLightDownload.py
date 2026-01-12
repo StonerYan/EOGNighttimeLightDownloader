@@ -449,6 +449,13 @@ def main():
         print("\nPhase 1: Scanning directory structure (this may take a while)...")
         collect_files(BASE_URL, save_dir, authenticator, all_files_to_download)
         
+        # Deduplicate files (remove duplicate URLs/paths)
+        # Convert list of lists/tuples to set of tuples for uniqueness
+        unique_files = list(set(tuple(item) for item in all_files_to_download))
+        if len(unique_files) < len(all_files_to_download):
+            print(f"Removed {len(all_files_to_download) - len(unique_files)} duplicate entries.")
+            all_files_to_download = unique_files
+        
         # Save to cache
         try:
             with open(CACHE_FILE, 'w', encoding='utf-8') as f:
@@ -456,6 +463,12 @@ def main():
             print(f"Scan complete. Saved {len(all_files_to_download)} files to '{CACHE_FILE}'.")
         except Exception as e:
             print(f"Warning: Could not save cache: {e}")
+    else:
+         # Also deduplicate loaded cache just in case
+         unique_files = list(set(tuple(item) for item in all_files_to_download))
+         if len(unique_files) < len(all_files_to_download):
+             print(f"Removed {len(all_files_to_download) - len(unique_files)} duplicate entries from cache.")
+             all_files_to_download = unique_files
 
     # Phase 2: Download Loop
     print(f"\nPhase 2: Starting download of {len(all_files_to_download)} files with {MAX_WORKERS} threads...")
